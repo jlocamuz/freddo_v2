@@ -20,7 +20,8 @@ from aux_functions import (
 
 # ================= CONFIG =================
 BASE = "https://api-prod.humand.co/public/api/v1"
-AUTH = "Basic Njc3NDUzMjpkNWR2Z1pzNXQ3ZEZ2XzE2Z2pfbV9XNklpVFNPU0NmMQ=="
+AUTH = "Basic *"
+
 MINUTOS_ADICIONAL_POR_HORA = 8
 FACTOR_ADICIONAL = MINUTOS_ADICIONAL_POR_HORA / 60
 
@@ -28,7 +29,7 @@ TOLERANCIA_TARDANZA_SEG = 10 * 60
 TOLERANCIA_RETIRO_SEG  = 10 * 60
 
 START_DATE = "2025-11-21"
-END_DATE   = "2025-12-20"
+END_DATE   = "2025-12-21"
 
 LIMIT_USERS = 50
 LIMIT_DAYS  = 500
@@ -37,10 +38,8 @@ MAX_WORKERS = 8
 
 TZ_AR = ZoneInfo("America/Argentina/Buenos_Aires")
 
-
 NORMALIZAR_A_MINUTO = True
-FILTRAR_SIN_ESQUEMA_JORNADA = False 
-
+FILTRAR_SIN_ESQUEMA_JORNADA = True  # False = no filtra / True = filtra
 
 CATEGORIAS = [
     "REGULAR",
@@ -150,14 +149,6 @@ def fetch_batch(emp_ids, user_map, legajo_map, esquema_map):
             hol     = it.get("holidays") or []
             cat     = it.get("categorizedHours") or []
 
-            hours_obj = it.get("hours") or {}
-            # worked = float(hours_obj.get("worked") or 0)
-            # scheduled = float(hours_obj.get("scheduled") or 0)
-
-            # has_useful_data = any([entries, slots, incid, tor, hol, cat, worked > 0, scheduled > 0])
-            # if not has_useful_data:
-            #     continue
-
             # Horario obligatorio (primer timeslot)
             sched_start = sched_end = pd.NaT
             if slots and isinstance(slots, list):
@@ -241,17 +232,12 @@ def build_df(employee_ids, user_map, legajo_map, esquema_map):
 
     df = pd.DataFrame(rows)
 
-
-
-
     df["HORAS_REGULAR"]  = pd.to_numeric(df.get("HORAS_REGULAR", 0), errors="coerce").fillna(0.0)
     df["HORAS_NOCTURNA"] = pd.to_numeric(df.get("HORAS_NOCTURNA", 0), errors="coerce").fillna(0.0)
     df["HORAS_EXTRA"]    = pd.to_numeric(df.get("HORAS_EXTRA", 0), errors="coerce").fillna(0.0)
 
-    df["HORAS_TRABAJADAS"] = df.apply(lambda r: duracion_horas_puras(r["_rs"], r["_re"]),axis=1)
+    df["HORAS_TRABAJADAS"] = df.apply(lambda r: duracion_horas_puras(r["_rs"], r["_re"]), axis=1)
     df["ADICIONAL_NOCTURNIDAD"] = (pd.to_numeric(df["HORAS_NOCTURNA"], errors="coerce").fillna(0) * FACTOR_ADICIONAL).round(4)
-
-
 
     df = aplicar_nocturnidad_50_100(df)
 
@@ -273,8 +259,9 @@ def main():
 
     df = build_df(employee_ids, user_map, legajo_map, esquema_map)
 
-    # Ordenar por nombres técnicos
     df = df.sort_values(by=["ID", "FECHA"], ascending=[True, True]).reset_index(drop=True)
+
+    # Filtrar solo con esquema (si True)
     if FILTRAR_SIN_ESQUEMA_JORNADA:
         df = df[
             df["ESQUEMA_JORNADA"].notna()
@@ -331,7 +318,36 @@ def main():
 
     df_export = df_export.rename(columns=rename_excel)
 
-    # ✅ Totales 50/100: DESPUÉS del rename (para usar nombres lindos)
+    # ==========================================================
+    # AJUSTE PART TIME:
+    # - Si Part Time: replica "Adicional Nocturnidad" en "Complementaria por nocturnidad"
+    #   y NO contabiliza nocturnidad a 50/100 (por nocturnidad).
+    # - Si Full Time: se mantiene la lógica normal; complementaria = 0 (queda vacía en Excel).
+    # ==========================================================
+    for col in ["Horas Extra 50% (por nocturnidad)", "Horas Extra 100% (por nocturnidad)"]:
+        if col not in df_export.columns:
+            df_export[col] = 0.0
+
+    if "Complementaria por nocturnidad" not in df_export.columns:
+        df_export["Complementaria por nocturnidad"] = 0.0
+
+    is_part_time = (
+        df_export.get("Esquema de Jornada", "")
+        .astype(str)
+        .str.upper()
+        .str.contains(r"\bPART\s*TIME\b", regex=True, na=False)
+    )
+
+    ad_noct = pd.to_numeric(df_export.get("Adicional Nocturnidad", 0), errors="coerce").fillna(0.0)
+
+    # Replica en complementaria SOLO si es Part Time y hay adicional
+    df_export.loc[is_part_time & (ad_noct > 0), "Complementaria por nocturnidad"] = ad_noct
+
+    # Anula el pase a 50/100 por nocturnidad cuando es Part Time
+    df_export.loc[is_part_time, "Horas Extra 50% (por nocturnidad)"] = 0.0
+    df_export.loc[is_part_time, "Horas Extra 100% (por nocturnidad)"] = 0.0
+
+    # ✅ Totales 50/100: DESPUÉS del ajuste Part Time
     df_export["Horas Extra 50% (total)"] = (
         pd.to_numeric(df_export.get("Horas Extra 50%", 0), errors="coerce").fillna(0.0)
         + pd.to_numeric(df_export.get("Horas Extra 50% (por nocturnidad)", 0), errors="coerce").fillna(0.0)
@@ -347,7 +363,7 @@ def main():
         errors="ignore"
     )
 
-    # ✅ Orden final EXACTO (50 -> 50 noct -> 50 total, y 100 idem)
+    # ✅ Orden final (Complementaria va ANTES de Horas Feriado)
     cols_final = [
         "ID",
         "Apellido, Nombre",
@@ -368,6 +384,7 @@ def main():
         "Horas Extra 100%",
         "Horas Extra 100% (por nocturnidad)",
         "Horas Extra 100% (total)",
+        "Complementaria por nocturnidad",  # 👈 NUEVA
         "Horas Feriado",
         "Horas Feriado Nocturnas",
         "Tardanza",
@@ -391,6 +408,7 @@ def main():
         "Horas Extra 100%",
         "Horas Extra 100% (por nocturnidad)",
         "Horas Extra 100% (total)",
+        "Complementaria por nocturnidad",  # 👈 NUEVA
         "Horas Feriado",
         "Horas Feriado Nocturnas",
         "Tardanza",
@@ -401,10 +419,7 @@ def main():
         if c in df_export.columns:
             df_export[c] = df_export[c].replace(0, "")
 
-
     df_export = df_export[cols_final]
-
-    
 
     EXPORTAR_DECIMAL = True
 
@@ -419,11 +434,13 @@ def main():
         "Horas Extra 100%",
         "Horas Extra 100% (por nocturnidad)",
         "Horas Extra 100% (total)",
+        "Complementaria por nocturnidad",  # 👈 NUEVA
         "Horas Feriado",
         "Horas Feriado Nocturnas",
         "Tardanza",
         "Retiro Anticipado",
     ]
+
     out = "reporte_basico.xlsx"
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
